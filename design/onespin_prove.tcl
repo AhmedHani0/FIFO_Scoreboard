@@ -16,7 +16,7 @@ set use_setup_database 0
 # Select what actions the tool should automatically perform
 # Check:   When true  it          performs proofs for all properties of the default task
 #          When false it does not perform  proofs for all properties of the default task
-set auto_check 0
+set auto_check 1
 # Witness: When true  it          computes witnesses for all properties of the default task
 #          When false it does not compute  witnesses for all properties of the default task
 set auto_witness 0

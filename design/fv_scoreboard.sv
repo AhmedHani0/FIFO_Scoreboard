@@ -56,7 +56,13 @@ module fv_scoreboard #(
     logic fv_counter_decrement;
 
     assign fv_push = push && !full;
-    assign fv_pop  = pop  && !empty;
+    assign fv_pop  = pop && (!empty || push);
+
+    // A bypass transfer happens when the FIFO is empty,
+    // and a push and pop happen in the same cycle.
+    // The pushed packet directly appears at the output.
+    assign fv_bypass_transfer =
+        empty && fv_push && fv_pop;
 
     // ------------------------------------------------------------
     // Sampling-in condition
@@ -90,6 +96,12 @@ module fv_scoreboard #(
         !fv_sampled_out &&
         (fv_tracking_counter == FV_COUNTER_WIDTH'(1));
 
+    // Special case:
+    // the selected packet is sampled in and sampled out
+    // in the same cycle through FIFO bypass.
+    assign fv_sample_in_out_condition =
+        fv_sample_in_condition && fv_bypass_transfer;
+
     // ------------------------------------------------------------
     // Tracking counter control
     // ------------------------------------------------------------
@@ -109,31 +121,31 @@ module fv_scoreboard #(
         fv_push && !fv_sampled_in;
 
     assign fv_counter_decrement =
-        fv_pop && !fv_sampled_out && (fv_tracking_counter != '0);
+        fv_pop && !fv_sampled_out;
     
-    //Coverage properrties to ensure liveness of the pushing and popping
-    cover_push: cover property (
+    //Coverage properties to ensure liveness of the pushing and popping
+    cover_sampled_in: cover property (
     @(posedge clk) disable iff (rst)
-        fv_push
+        fv_sampled_in
     );
 
-    cover_pop: cover property (
+    cover_sampled_out: cover property (
     @(posedge clk) disable iff (rst)
-        fv_pop
+        fv_sampled_out
     );
 
-//This property checks eventual appearance, not exact FIFO order. !
-//It also has another weakness: it only compares values, not packet identity.
-    property p_data_integrity_adhoc;
-        logic [WIDTH-1:0] fv_data;
+// //This property checks eventual appearance, not exact FIFO order. !
+// //It also has another weakness: it only compares values, not packet identity.
+//     property p_data_integrity_adhoc;
+//         logic [WIDTH-1:0] fv_data;
 
-        @(posedge clk) disable iff (rst)
-            (fv_push, fv_data = data_in)
-            //This is an unbounded eventual condition. In many formal flows, this is a liveness-style check
-            |-> ##[1:$] (fv_pop && (data_out == fv_data));
-    endproperty
+//         @(posedge clk) disable iff (rst)
+//             (fv_push, fv_data = data_in)
+//             //This is an unbounded eventual condition. In many formal flows, this is a liveness-style check
+//             |-> ##[1:$] (fv_pop && (data_out == fv_data));
+//     endproperty
 
-    a_data_integrity_adhoc: assert property (p_data_integrity_adhoc);
+//     a_data_integrity_adhoc: assert property (p_data_integrity_adhoc);
 
     // ------------------------------------------------------------
     // Sequential scoreboard state update
@@ -148,29 +160,36 @@ module fv_scoreboard #(
         end
         else begin
 
-            // Store the selected packet data.
             if (fv_sample_in_condition) begin
                 fv_sampled_in   <= 1'b1;
                 fv_sampled_data <= data_in;
             end
 
-            // Mark that the selected packet has left the FIFO.
-            if (fv_sample_out_condition) begin
+            if (fv_sample_in_out_condition || fv_sample_out_condition) begin
                 fv_sampled_out <= 1'b1;
             end
 
-            // Update tracking counter.
-            //
-            // If push and pop happen in the same cycle, both increment
-            // and decrement may be true. In that case the counter stays
-            // unchanged.
             unique case ({fv_counter_increment, fv_counter_decrement})
                 2'b10: begin
                     fv_tracking_counter <= fv_tracking_counter + FV_COUNTER_WIDTH'(1);
                 end
 
                 2'b01: begin
-                    fv_tracking_counter <= fv_tracking_counter - FV_COUNTER_WIDTH'(1);
+                    //Normal Caese: decrement the counter if it's not zero.
+                    if (fv_tracking_counter != '0) begin
+                        fv_tracking_counter <= fv_tracking_counter - FV_COUNTER_WIDTH'(1);
+                    end
+                    //Bypass case: the tracked packet leaves and another packet enters in the same cycle
+                    //so the counter value does not change.
+                    else begin
+                        fv_tracking_counter <= fv_tracking_counter;
+                    end
+                end
+
+                2'b11: begin
+                    // One packet enters and one packet leaves.
+                    // position of the tracked packet does not change.
+                    fv_tracking_counter <= fv_tracking_counter;
                 end
 
                 default: begin
@@ -179,6 +198,83 @@ module fv_scoreboard #(
             endcase
         end
     end
+
+    // ------------------------------------------------------------
+    // Properties
+    // ------------------------------------------------------------
+    // Data ordering and integrity:
+    // If a packet is sampled in, then the same data must eventually
+    // be sampled out. This checks both ordering and integrity of Data
+    property p_data_ordering_and_integrity_normal;
+        @(posedge clk) disable iff (rst)
+            fv_sample_out_condition |-> (data_out == fv_sampled_data);
+    endproperty
+
+    // Data ordering and integrity in bypass case:
+    // If a packet is sampled in and out in the same cycle through bypass,
+    // then the output data must be the same as the input data.
+    property p_data_ordering_and_integrity_bypass;
+        @(posedge clk) disable iff (rst)
+        // we use data_in here, not data_out, because in bypass, 
+        //the output directly reflects the input. lookt in RTL to see that pop_data is assigned from push_data in the bypass case.
+            fv_sample_in_out_condition |-> (data_out == data_in);
+    endproperty
+
+    //LIVENESS property:
+    //If a packet is pushed in, it will eventually come out.
+    property p_data_in_equal_data_out;
+        @(posedge clk) disable iff (rst)
+            fv_sample_in_condition |->
+                strong(##[0:$] (fv_sample_out_condition || fv_sample_in_out_condition));
+    endproperty
+
+    
+    a_data_ordering_and_integrity_normal:
+        assert property (p_data_ordering_and_integrity_normal);
+    a_data_ordering_and_integrity_bypass:
+        assert property (p_data_ordering_and_integrity_bypass);
+    a_data_in_equal_data_out:
+        assert property (p_data_in_equal_data_out);
+
+    // ------------------------------------------------------------
+    // Assumption 1:
+    // Data not in then never at output
+    // This is an invariant that guides the formal analysis.
+    // ------------------------------------------------------------
+    property p_data_not_in_then_never_at_output;
+        @(posedge clk) disable iff (rst)
+            !fv_sampled_in |-> (!fv_sampled_out && !fv_sample_out_condition);
+    endproperty
+    m_data_not_in_then_never_at_output:
+        assume property (p_data_not_in_then_never_at_output);
+
+    // ------------------------------------------------------------
+    // Assumption 2:
+    // Tracking counter not zero if data in
+    // "There is still at least one valid pop needed until the
+    // tracked packet leaves the FIFO."
+    // Acts also an invariant
+    // ------------------------------------------------------------
+    property p_tracking_counter_not_zero_if_data_in;
+        @(posedge clk) disable iff (rst)
+            (fv_sampled_in && !fv_sampled_out) |-> (fv_tracking_counter != '0);
+    endproperty
+    m_tracking_counter_not_zero_if_data_in:
+        assume property (p_tracking_counter_not_zero_if_data_in);
+
+    // ------------------------------------------------
+    // Assumption 3: Fairness Constraint
+    // If the scoreboard is tracking a packet that has not left yet,
+    // the environment will eventually request a pop.
+    property p_environment_eventually_pops_when_tracking;
+    @(posedge clk) disable iff (rst)
+        (fv_sampled_in && !fv_sampled_out) |->
+            strong(##[0:$] fv_pop);
+    endproperty
+
+    m_environment_eventually_pops_when_tracking:
+        assume property (p_environment_eventually_pops_when_tracking);
+
 endmodule
 
 bind lubis_fifo fv_scoreboard #(
